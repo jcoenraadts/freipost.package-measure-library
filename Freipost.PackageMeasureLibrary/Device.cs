@@ -43,6 +43,31 @@ namespace Freipost.HAL
         }
     }
 
+    public class CalibrationReading
+    {
+        public int Multiplier { get; set; }
+        public int Offset { get; set; }
+        public int TareValue { get; set; }
+
+        public CalibrationReading() { }
+
+        public CalibrationReading(string rawReading)
+        {
+            // parse the response <mult>,<offset>,<tare value>,<0>
+            try
+            {
+                char[] separators = { ',' };
+                string[] parts = rawReading.Split(separators);
+
+                this.Multiplier = Int32.Parse(parts[0]);
+                this.Offset = Int32.Parse(parts[1]);
+                this.TareValue = Int32.Parse(parts[2]);
+            }
+            catch (Exception e)
+            {
+            }
+        }
+    }
     /// <summary>
     /// The cal process is as follows:
     /// 1. Reset the Tare Value with TareReset()
@@ -63,6 +88,9 @@ namespace Freipost.HAL
         private const int DEFAULT_LC_MULT = 10000;
         private const int DEFAULT_LC_OFFSET = 0;
         private const int CAL_READING_COUNT = 8;
+        private const int COMMS_DELAY = 5; //ms
+        private const int AVERAGE_READING_DELAY = 100; //ms
+        private const int COMMS_RETRY_COUNT = 3;
 
         private string InstrTare = "T";
         private string InstrTareReset = "S";
@@ -72,10 +100,11 @@ namespace Freipost.HAL
         private string InstrYMax = "Y";
         private string InstrZMax = "Z";
         private string InstrRead = "R";
+        private string InstrReadCal = "L";
 
         private string ResponseOk = "OK";
-        private string ResponseError = "ERROR";
-        
+        private string ResponseErrorBadCommand = "ERROR_CMD";
+        private string ResponseErrorIncorrectLength = "ERROR_LENGTH";
 
         public Device()
         {
@@ -90,6 +119,7 @@ namespace Freipost.HAL
         {
             P = new SerialPort(comport, BAUD_RATE);
             P.ReadTimeout = TIMEOUT;
+            P.NewLine = "\r";
             P.Open();
         }
 
@@ -139,13 +169,14 @@ namespace Freipost.HAL
         public void DoOffsetCalibration()
         {
             this.TareReset();
-            this.setLoadCellOffset(DEFAULT_LC_OFFSET);
-            this.setLoadCellMultiplier(DEFAULT_LC_MULT);
+            this.SetLoadCellOffset(DEFAULT_LC_OFFSET);
+            this.SetLoadCellMultiplier(DEFAULT_LC_MULT);
+            System.Threading.Thread.Sleep(200);  //give it time to get a reading
 
-            int offsetValue = (int)getAverageMass();
+            int offsetValue = (int)GetAverageMass();
 
             // write the value to the device
-            this.setLoadCellOffset(offsetValue);
+            this.SetLoadCellOffset(offsetValue);
         }
 
         /// <summary>
@@ -156,11 +187,18 @@ namespace Freipost.HAL
         /// </summary>
         public void DoMultiplierCalibration(int referenceMass)
         {
-            double rawMass = getAverageMass();
+            System.Threading.Thread.Sleep(200);  //give it time to get a reading
+            double rawMass = GetAverageMass();
             double multiplier = (double)referenceMass / rawMass * 10000;
 
             // write the value to the device
-            this.setLoadCellMultiplier((int)multiplier);
+            this.SetLoadCellMultiplier((int)multiplier);
+        }
+
+        public CalibrationReading ReadCalibration()
+        {
+            string readingStr = this.writeRead(this.InstrReadCal);
+            return new CalibrationReading(readingStr);
         }
 
         public DeviceReading Read()
@@ -169,57 +207,11 @@ namespace Freipost.HAL
             return new DeviceReading(readingStr);
         }
 
-
-        #region private methods
-
-        private void write(string instruction, int value = 0)
-        {
-            this.writeRead(instruction, value);
-        }
-
-        private string writeRead(string instruction, int value = 0)
-        {
-            string message = instruction + value.ToString("X4");
-            P.WriteLine(message);
-            
-            // read the response
-            string status = P.ReadLine();
-            string response = "";
-
-            // if it is neither error or ok, then it must be a response
-            if (!status.Contains(this.ResponseOk) && !status.Contains(this.ResponseError))
-            {
-                response = status;
-                //and we should read the status again
-                status = P.ReadLine();
-            }
-
-            // throw exception if we have an error
-            if (status.Contains(this.ResponseError))
-            {
-                throw new DeviceException("The device returned an error in response to command: " + instruction + " " + value.ToString());
-            }
-            
-            return response;
-        }
-
-        /// <summary>
-        /// Executes multiple read commands to get an average for calibration
-        /// </summary>
-        /// <returns></returns>
-        private double getAverageMass()
-        {
-            double mass = 0;
-            for (int i = 0; i < CAL_READING_COUNT; i++)
-                mass += this.Read().Mass;
-            return mass / CAL_READING_COUNT;
-        }
-
         /// <summary>
         /// Sets the cal values in the device. 
         /// </summary>
         /// <param name="offset">The offset to value to bring the scales to 0 with no mass</param>
-        private void setLoadCellOffset(int offset)
+        public void SetLoadCellOffset(int offset)
         {
             this.write(this.InstrLoadCellOffset, offset);
         }
@@ -228,10 +220,144 @@ namespace Freipost.HAL
         /// Sets the cal values in the device. 
         /// </summary>
         /// <param name="multiplier">The calibration factor which maps the measured value to a real mass</param>
-        private void setLoadCellMultiplier(int multiplier)
+        public void SetLoadCellMultiplier(int multiplier)
         {
             this.write(this.InstrLoadCellMult, multiplier);
         }
+
+        public double GetAverageMass()
+        {
+            double mass = 0;
+            for (int i = 0; i < CAL_READING_COUNT; i++)
+            {
+                mass += this.Read().Mass;
+                System.Threading.Thread.Sleep(AVERAGE_READING_DELAY);
+            }
+            return mass / CAL_READING_COUNT;
+        }
+
+
+        #region private methods
+
+        private void write(string instruction, int value = 0)
+        {
+            writeRead(instruction, value);
+        }
+
+        /// <summary>
+        /// Firmware process:
+        /// 1. Write message to device with format <instruction-1><sign-1><value-8><newline-1>
+        /// 2. Read full message echo - should match
+        /// 3. Read status, can be: "OK", "ERROR_LENGTH" or "ERROR_CMD"
+        /// 4. If read is required (e.g. for status request) read the message
+        /// </summary>
+        /// <param name="instruction"></param>
+        /// <param name="value"></param>
+        /// <returns></returns>
+        private string writeRead(string instruction, int value = 0)
+        {
+            string response = "";
+            // 3 retries
+            for (int retryIndex = 1; retryIndex <= COMMS_RETRY_COUNT; retryIndex++)
+            {
+                Console.WriteLine("\nRetry: " + retryIndex.ToString());
+
+                // write the instruction and data
+                string sign = value >= 0 ? "+" : "-";
+                string message = instruction + sign + (Math.Abs(value)).ToString("X8") + "\r";
+                Console.WriteLine("Writing: " + message);
+
+                byte[] bytes = Encoding.ASCII.GetBytes(message);
+                for (int i = 0; i < bytes.Length; i++)
+                {
+                    byte[] tempBytes = { bytes[i] };
+                    P.Write(tempBytes, 0, 1);
+                    System.Threading.Thread.Sleep(COMMS_DELAY);
+                }
+
+                // read the echo
+                string echo = P.ReadLine();
+                Console.WriteLine("Echo: " + echo);
+
+                //read the status - if error, no more data will follow
+                string status = P.ReadLine();
+
+                // check for response
+                if (!status.Contains("ERROR") && !status.Contains("OK"))
+                {
+                    response = status;
+                    Console.WriteLine("Response: " + response);
+                    status = P.ReadLine();
+                }
+
+                Console.WriteLine("Status: " + status);
+
+                if (status.Contains("ERROR"))
+                {
+                    throw new DeviceException("The device returned an error in response to command: " + message + " with echo: " + echo);
+                }
+
+                // check if the echo was correct, then exit
+                if(message.Trim() == echo)
+                {
+                    break;
+                }
+
+                // if retires have expired
+                if (retryIndex >= COMMS_RETRY_COUNT)
+                {
+                    throw new DeviceException("The device failed to parse message " + COMMS_RETRY_COUNT.ToString() + " times");
+                }
+            }
+
+            return response;
+        }
+
+
+        //private string writeRead(string instruction, int value = 0)
+        //{
+        //    this.write(instruction, value);
+
+        //    // read the response - only for status right now
+        //    string response = P.ReadLine();
+        //    Console.WriteLine("Response: " + response);
+
+        //    //char[] separators = { ',' };
+        //    //string[] parts = retVal.Split(separators);
+        //    //int returnedInt = Int32.Parse(parts[0]);
+        //    //if (returnedInt != value)
+        //    //{
+        //    //    value++;
+        //    //}
+
+        //    //// read the response
+        //    //string status = P.ReadLine();
+        //    //string response = "";
+
+        //    // if it is neither error or ok, then it must be a response
+        //    //if (!status.Contains(this.ResponseOk) && !status.Contains(this.ResponseError))
+        //    //{
+        //    //    response = status;
+        //    //    //and we should read the status again
+        //    //    status = P.ReadLine();
+        //    //}
+
+        //    // throw exception if we have an error
+        //    //if (status.Contains(this.ResponseError))
+        //    //{
+        //    //    throw new DeviceException("The device returned an error in response to command: " + instruction + " " + value.ToString());
+        //    //}
+
+        //    return response;
+        //}
+
+        /// <summary>
+        /// Executes multiple read commands to get an average for calibration
+        /// </summary>
+        /// <returns></returns>
+        
+
+        
 
         #endregion
     }

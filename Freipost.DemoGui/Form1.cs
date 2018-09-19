@@ -16,7 +16,7 @@ namespace FreiPost.DemoGui
         private Timer timer;
 
         private int maxRange = 800;     //mm, sets bar lengths on UI
-        private const int REFERENCE_MASS = 1000; //grams
+        private const int REFERENCE_MASS = 2000; //grams
 
         private delegate void updateUIDelegate(int mass_g, int x_mm, int y_mm, int z_mm);
         private updateUIDelegate _updateUIDelegate;
